@@ -78,29 +78,66 @@ def _(log, logging):
 
 
 @app.cell
-def _(
-    FTP_HOST,
-    FTP_ROOT_PATH,
-    NWP_RUN,
-    PurePosixPath,
-    ReadOnly,
-    TypedDict,
-    json,
-    log,
-    log_rclone_output,
-    subprocess,
-):
+def _(log, log_rclone_output, subprocess):
+    import signal
+    import ctypes
+
+    # Load the libc library to access prctl
+    libc = ctypes.CDLL("libc.so.6")
+
+
+    def set_death_signal():
+        # Send SIGTERM to the child (rclone) if the parent (python) dies
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+
+
+    def call_command_with_logging(cmd: list, timeout: int = 90) -> str:
+        log.info("Command: %s", " ".join(cmd))
+        # Rclone sends its progress and status messages to stderr.
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, preexec_fn=set_death_signal
+        )
+        # The subprocess docs say we can't use `process.wait` if the process returns lots of data in a PIPE,
+        # instead we have to use `process.communicate`.
+        stdout_str, stderr_str = process.communicate(timeout=timeout)
+        log_rclone_output(stderr_str)
+
+        if process.returncode == 0:
+            return stdout_str
+        else:
+            error_msg = f"rclone return code is {process.returncode}. stdout={stdout_str}"
+            log.error(error_msg)
+            raise RuntimeError(error_msg)
+    return (call_command_with_logging,)
+
+
+@app.cell
+def _(ReadOnly, TypedDict):
     class ListItem(TypedDict):
         Path: ReadOnly[str]
         Name: ReadOnly[str]
         Size: ReadOnly[int]
         ModTime: ReadOnly[str]
         IsDir: ReadOnly[bool]
+    return (ListItem,)
 
 
+@app.cell
+def _(
+    FTP_HOST,
+    FTP_ROOT_PATH,
+    ListItem,
+    NWP_RUN,
+    PurePosixPath,
+    call_command_with_logging,
+    json,
+    log,
+):
     def ftp_list(ftp_host: str, path: PurePosixPath) -> list[ListItem]:
         """
         Uses rclone lsjson to get a full recursive list of files very quickly.
+
         Returns a list of ListItem dictionaries. Note that the `Path` attribute in the returned dict does not
         include the `path` input to this function. For example, a returned `Path` might look like
         "aswdifd_s/icon-eu_europe_regular-lat-lon_single-level_2026011200_004_ASWDIFD_S.grib2.bz2"
@@ -119,21 +156,10 @@ def _(
             "--fast-list",  # Optimizes listing for some remotes.
             "--no-mimetype",  # Don't read the mime type (can speed things up).
             "--no-modtime",  # Don't read the modification time (can speed things up).
-            "--quiet",
+            "--config=",  # There is no rclone config file. We pass in all config as arguments.
         ]
 
-        log.info("Command: %s", " ".join(cmd))
-        # Rclone sends its progress and status messages to stderr.
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        # The subprocess docs say we can't use `process.wait` if the process returns lots of data in a PIPE,
-        # instead we have to use `process.communicate`.
-        stdout_str, stderr_str = process.communicate(timeout=90)
-        log_rclone_output(stderr_str)
-
-        if process.returncode != 0:
-            error_msg = f"rclone return code is {process.returncode}"
-            log.error(error_msg)
-            raise RuntimeError(error_msg)
+        stdout_str = call_command_with_logging(cmd, timeout=90)
 
         try:
             return json.loads(stdout_str)
@@ -143,7 +169,7 @@ def _(
 
 
     listing = ftp_list(FTP_HOST, FTP_ROOT_PATH / NWP_RUN)
-    return ListItem, listing
+    return (listing,)
 
 
 @app.cell
@@ -169,13 +195,11 @@ def _(
 
     def generate_batches(file_list: list[ListItem]) -> dict[tuple[str, PurePosixPath], list[str]]:
         """
-        Groups files by their transfer logic:
-        (Source Directory) -> (Destination Directory)
-
         Returns a dict which maps from (src_directory, dst_directory) to a list of filenames.
+
         For example:
         (
-            'opendata.dwd.de/weather/nwp/icon-eu/grib/00/alb_rad',
+            PurePosixPath('/weather/nwp/icon-eu/grib/00/alb_rad'),
             PurePosixPath('/home/jack/data/ICON-EU/grib/rsync_and_python/2026-01-12T00Z/alb_rad')
         ): [
             "icon-eu_europe_regular-lat-lon_single-level_2026011200_000_ALB_RAD.grib2.bz2",
@@ -211,12 +235,9 @@ def _(
                 continue
             param_name = file_path.parts[0]  # e.g. 'alb_rad'
 
-            # Define Source and Dest Bases for this specific file
-            # We group by the directory, not the file, so rclone can move lists of files
             src_dir_url = FTP_ROOT_PATH / NWP_RUN / file_path.parent
             dest_dir_url = DST_ROOT_PATH / date_dir / param_name
 
-            # Add filename to this specific batch
             batch_key = (src_dir_url, dest_dir_url)
             batches[batch_key].append(file_path.name)
 
@@ -234,7 +255,7 @@ def _(batches):
 
 
 @app.cell
-def _(log, os, subprocess, tempfile):
+def _(call_command_with_logging, log, os, subprocess, tempfile):
     def run_transfers(batches):
         """
         Iterates through batches, creates a temp file list, and runs rclone.
@@ -243,6 +264,11 @@ def _(log, os, subprocess, tempfile):
         log.info("Processing %s batch groups...", total_batches)
 
         for i, ((src_url, dest_url), filenames) in enumerate(batches.items(), 1):
+            if i < 40:
+                continue
+            elif i > 50:
+                break
+
             log.info(f"[{i}/{total_batches}] Syncing {len(filenames)} files to {dest_url}...")
 
             # Create a temporary file to hold the list of filenames for this batch
@@ -265,19 +291,19 @@ def _(log, os, subprocess, tempfile):
                 "--transfers",
                 "10",  # Increase parallelism within the batch
                 "--no-check-certificate",
+                "--config=",  # There is no rclone config file.
+                "--no-traverse",
             ]
-            log.info("Command: %s", " ".join(cmd))
 
             try:
-                # Run rclone (suppress stdout to keep logs clean, show stderr on error)
-                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+                stdout_str = call_command_with_logging(cmd, timeout=60 * 5)
             except subprocess.CalledProcessError as e:
                 log.exception(f"Error syncing batch {src_url}: {e}")
+            else:
+                if stdout_str:
+                    log.info("Rclone stdout: %s", stdout_str)
             finally:
                 os.remove(tmp_path)
-
-            if i == 20:
-                break
     return (run_transfers,)
 
 
