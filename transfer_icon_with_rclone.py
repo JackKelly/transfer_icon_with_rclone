@@ -50,10 +50,11 @@ def _(log, logging):
             if not clean_line:
                 continue
 
-            # rclone uses "ERROR", "WARNING", "INFO" in its output.
-            if "ERROR" in clean_line:
+            # rclone uses "Error", "Warning", "Info" in its output.
+            line_upper = clean_line.upper()
+            if "ERROR" in line_upper or "FAILED" in line_upper:
                 log_level = logging.ERROR
-            elif "WARNING" in clean_line:
+            elif "WARNING" in line_upper:
                 log_level = logging.WARNING
             else:
                 log_level = logging.INFO
@@ -72,7 +73,7 @@ def _(
     log_rclone_output,
     subprocess,
 ):
-    def get_all_files(ftp_host: str, path: PurePosixPath):
+    def list(ftp_host: str, path: PurePosixPath):
         """
         Uses rclone lsjson to get a full recursive list of files very quickly.
         Returns a list of file dictionaries.
@@ -84,7 +85,7 @@ def _(
             f"--ftp-host={ftp_host}",
             "--ftp-user=anonymous",
             # rclone requires passwords to be obscured by encrypting & encoding them in base64.
-            # The base64 string below was created with `rclone obscure guest`.
+            # The base64 string below was created with the command `rclone obscure guest`.
             "--ftp-pass=JUznDm8DV5bQBCnXNVtpK3dN1qHB",
             f":ftp:{path}",
             "--recursive",
@@ -95,18 +96,18 @@ def _(
         ]
 
         log.info("Command: %s", " ".join(cmd))
-        # We use stderr=subprocess.PIPE to capture the logs
         # Rclone sends its progress and status messages to stderr.
-        # We use bufsize=1 and text=True for line-buffered string output
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         # The subprocess docs say we can't use `process.wait` if the process returns lots of data in a PIPE,
         # instead we have to use `process.communicate`.
         stdout_str, stderr_str = process.communicate(timeout=90)
         log_rclone_output(stderr_str)
+
         if process.returncode != 0:
-            error_msg = "rclone return code is {process.returncode}"
+            error_msg = f"rclone return code is {process.returncode}"
             log.error(error_msg)
             raise RuntimeError(error_msg)
+
         try:
             return json.loads(stdout_str)
         except json.decoder.JSONDecodeError as e:
@@ -114,7 +115,13 @@ def _(
             raise
 
 
-    listing = get_all_files(FTP_HOST, FTP_ROOT_PATH / "00")
+    listing = list(FTP_HOST, FTP_ROOT_PATH / "00")
+    return (listing,)
+
+
+@app.cell
+def _(listing):
+    listing[-10:]
     return
 
 
