@@ -87,7 +87,9 @@ def _(log, log_rclone_output, subprocess):
 
 
     def set_death_signal():
-        # Send SIGTERM to the child (rclone) if the parent (python) dies
+        # Send SIGTERM to the child (rclone) if the parent (python) dies.
+        # This works even if someone runs `kill -9 python`.
+        # This does nothing if the Python process keeps running.
         PR_SET_PDEATHSIG = 1
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
 
@@ -98,9 +100,25 @@ def _(log, log_rclone_output, subprocess):
         process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, preexec_fn=set_death_signal
         )
-        # The subprocess docs say we can't use `process.wait` if the process returns lots of data in a PIPE,
-        # instead we have to use `process.communicate`.
-        stdout_str, stderr_str = process.communicate(timeout=timeout)
+        try:
+            # The subprocess docs say we can't use `process.wait` if the process returns lots of data in a PIPE,
+            # instead we have to use `process.communicate`.
+            stdout_str, stderr_str = process.communicate(timeout=timeout)
+        except (KeyboardInterrupt, SystemExit):
+            # We have to explicitly tell `process` to terminate, to avoid having zombie processes.
+            # Note that `kill -9 python` will not raise KeyboardInterrupt or SystemExit, hence why we also have to set the death signal.
+            log.exception("Python is shutting down! Terminating rclone...")
+            process.terminate()  # Sends SIGTERM
+            try:
+                stdout_str, stderr_str = process.communicate(timeout=5)  # Give it 5 seconds to wrap up
+            except subprocess.TimeoutExpired:
+                process.kill()  # Force kill if it's stubborn
+            else:
+                log_rclone_output(stderr_str)
+                if stdout_str:
+                    log.info("Rclone stdout during shutdown: %s", stdout_str)
+            raise
+
         log_rclone_output(stderr_str)
 
         if process.returncode == 0:
@@ -246,12 +264,6 @@ def _(
 
     batches = generate_batches(listing)
     return (batches,)
-
-
-@app.cell
-def _(batches):
-    batches
-    return
 
 
 @app.cell
