@@ -38,8 +38,10 @@ def _():
         json,
         log,
         logging,
+        os,
         re,
         subprocess,
+        tempfile,
     )
 
 
@@ -153,7 +155,6 @@ def _(listing):
 @app.cell
 def _(
     DATE_REGEX,
-    FTP_HOST,
     FTP_ROOT_PATH,
     ListItem,
     NWP_RUN,
@@ -172,6 +173,15 @@ def _(
         (Source Directory) -> (Destination Directory)
 
         Returns a dict which maps from (src_directory, dst_directory) to a list of filenames.
+        For example:
+        (
+            'opendata.dwd.de/weather/nwp/icon-eu/grib/00/alb_rad',
+            PurePosixPath('/home/jack/data/ICON-EU/grib/rsync_and_python/2026-01-12T00Z/alb_rad')
+        ): [
+            "icon-eu_europe_regular-lat-lon_single-level_2026011200_000_ALB_RAD.grib2.bz2",
+            "icon-eu_europe_regular-lat-lon_single-level_2026011200_001_ALB_RAD.grib2.bz2",
+            ...
+        ]
         """
         batches = defaultdict(list)
 
@@ -203,7 +213,7 @@ def _(
 
             # Define Source and Dest Bases for this specific file
             # We group by the directory, not the file, so rclone can move lists of files
-            src_dir_url = f"{FTP_HOST}{FTP_ROOT_PATH / NWP_RUN / file_path.parent}"
+            src_dir_url = FTP_ROOT_PATH / NWP_RUN / file_path.parent
             dest_dir_url = DST_ROOT_PATH / date_dir / param_name
 
             # Add filename to this specific batch
@@ -224,8 +234,56 @@ def _(batches):
 
 
 @app.cell
-def _(PurePosixPath):
-    PurePosixPath("opendata.dwd.de/weather/nwp/icon-eu/grib/00/aswdifd_s")
+def _(log, os, subprocess, tempfile):
+    def run_transfers(batches):
+        """
+        Iterates through batches, creates a temp file list, and runs rclone.
+        """
+        total_batches = len(batches)
+        log.info("Processing %s batch groups...", total_batches)
+
+        for i, ((src_url, dest_url), filenames) in enumerate(batches.items(), 1):
+            log.info(f"[{i}/{total_batches}] Syncing {len(filenames)} files to {dest_url}...")
+
+            # Create a temporary file to hold the list of filenames for this batch
+            with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tmp:
+                tmp.write("\n".join(filenames))
+                tmp_path = tmp.name
+
+            cmd = [
+                "rclone",
+                "copy",
+                "--ftp-host=opendata.dwd.de",
+                "--ftp-user=anonymous",
+                # rclone requires passwords to be obscured by encrypting & encoding them in base64.
+                # The base64 string below was created with the command `rclone obscure guest`.
+                "--ftp-pass=JUznDm8DV5bQBCnXNVtpK3dN1qHB",
+                f":ftp:{src_url}",
+                str(dest_url),
+                "--files-from",
+                tmp_path,
+                "--transfers",
+                "10",  # Increase parallelism within the batch
+                "--no-check-certificate",
+            ]
+            log.info("Command: %s", " ".join(cmd))
+
+            try:
+                # Run rclone (suppress stdout to keep logs clean, show stderr on error)
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+            except subprocess.CalledProcessError as e:
+                log.exception(f"Error syncing batch {src_url}: {e}")
+            finally:
+                os.remove(tmp_path)
+
+            if i == 20:
+                break
+    return (run_transfers,)
+
+
+@app.cell
+def _(batches, run_transfers):
+    run_transfers(batches)
     return
 
 
